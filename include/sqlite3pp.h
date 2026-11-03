@@ -31,9 +31,13 @@
 #define SQLITE3PP_VERSION_PATCH 8
 
 #include <functional>
+#include <cstdarg>
+#include <cstring>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 
 #ifdef SQLITE3PP_LOADABLE_EXTENSION
@@ -77,6 +81,8 @@ namespace sqlite3pp
         noncopyable& operator=(noncopyable const&) = delete;
     };
 
+    // SQLite serializes connection calls only when opened in serialized mode;
+    // concurrent wrapper mutation and destruction still require external synchronization.
     class DllExport database : noncopyable
     {
         friend class statement;
@@ -136,6 +142,10 @@ namespace sqlite3pp
         database(sqlite3* pdb);
 
     private:
+        void clear_handlers();
+        void rebind_handlers();
+
+    private:
         sqlite3* db_;
         bool borrowing_;
 
@@ -144,6 +154,11 @@ namespace sqlite3pp
         rollback_handler rh_;
         update_handler uh_;
         authorize_handler ah_;
+        bool busy_handler_installed_ = false;
+        bool commit_handler_installed_ = false;
+        bool rollback_handler_installed_ = false;
+        bool update_handler_installed_ = false;
+        bool authorize_handler_installed_ = false;
     };
 
     class DllExport database_error : public std::runtime_error
@@ -307,6 +322,8 @@ namespace sqlite3pp
             void const* get(int idx, void const*) const;
             char16_t const* get(int idx, char16_t const*) const;            
             null_type get(int idx, null_type) const;
+            // The view remains valid only until the statement advances, resets, or is finalized.
+            std::string_view get(int idx, std::string_view) const;
 
         private:
             sqlite3_stmt* stmt_;
@@ -364,38 +381,53 @@ namespace sqlite3pp
     };
 
 
-    null_type ignore;
+    inline null_type ignore;
 
     namespace
     {
         int busy_handler_impl(void* p, int cnt)
         {
-            auto h = static_cast<database::busy_handler*>(p);
-            return (*h)(cnt);
+            try {
+                auto h = static_cast<database::busy_handler*>(p);
+                return (*h)(cnt);
+            }
+            catch (...) { return 0; }
         }
 
         int commit_hook_impl(void* p)
         {
-            auto h = static_cast<database::commit_handler*>(p);
-            return (*h)();
+            try {
+                auto h = static_cast<database::commit_handler*>(p);
+                return (*h)();
+            }
+            catch (...) { return 1; }
         }
 
         void rollback_hook_impl(void* p)
         {
-            auto h = static_cast<database::rollback_handler*>(p);
-            (*h)();
+            try {
+                auto h = static_cast<database::rollback_handler*>(p);
+                (*h)();
+            }
+            catch (...) {}
         }
 
         void update_hook_impl(void* p, int opcode, char const* dbname, char const* tablename, long long int rowid)
         {
-            auto h = static_cast<database::update_handler*>(p);
-            (*h)(opcode, dbname, tablename, rowid);
+            try {
+                auto h = static_cast<database::update_handler*>(p);
+                (*h)(opcode, dbname, tablename, rowid);
+            }
+            catch (...) {}
         }
 
         int authorizer_impl(void* p, int evcode, char const* p1, char const* p2, char const* dbname, char const* tvname)
         {
-            auto h = static_cast<database::authorize_handler*>(p);
-            return (*h)(evcode, p1, p2, dbname, tvname);
+            try {
+                auto h = static_cast<database::authorize_handler*>(p);
+                return (*h)(evcode, p1, p2, dbname, tvname);
+            }
+            catch (...) { return SQLITE_DENY; }
         }
 
     } // namespace
@@ -418,8 +450,8 @@ namespace sqlite3pp
     {
     }
 
-    database::database(database&& db) : db_(std::move(db.db_)),
-        borrowing_(std::move(db.borrowing_)),
+    database::database(database&& db) : db_(db.db_),
+        borrowing_(db.borrowing_),
         bh_(std::move(db.bh_)),
         ch_(std::move(db.ch_)),
         rh_(std::move(db.rh_)),
@@ -427,49 +459,112 @@ namespace sqlite3pp
         ah_(std::move(db.ah_))
     {
         db.db_ = nullptr;
+        db.borrowing_ = false;
+        db.busy_handler_installed_ = false;
+        db.commit_handler_installed_ = false;
+        db.rollback_handler_installed_ = false;
+        db.update_handler_installed_ = false;
+        db.authorize_handler_installed_ = false;
+        rebind_handlers();
     }
 
     database& database::operator=(database&& db)
     {
-        db_ = std::move(db.db_);
+        if (this == &db) return *this;
+        const auto rc = disconnect();
+        if (rc != SQLITE_OK) throw database_error(*this);
+
+        db_ = db.db_;
         db.db_ = nullptr;
-        borrowing_ = std::move(db.borrowing_);
+        borrowing_ = db.borrowing_;
+        db.borrowing_ = false;
         bh_ = std::move(db.bh_);
         ch_ = std::move(db.ch_);
         rh_ = std::move(db.rh_);
         uh_ = std::move(db.uh_);
         ah_ = std::move(db.ah_);
+        rebind_handlers();
+        db.busy_handler_installed_ = false;
+        db.commit_handler_installed_ = false;
+        db.rollback_handler_installed_ = false;
+        db.update_handler_installed_ = false;
+        db.authorize_handler_installed_ = false;
 
         return *this;
     }
 
     database::~database()
     {
-        if (!borrowing_) {
-            disconnect();
-        }
+        clear_handlers();
+        if (db_ && !borrowing_) sqlite3_close_v2(db_);
+        db_ = nullptr;
     }
 
     int database::connect(char const* dbname, int flags, char const* vfs)
     {
-        if (!borrowing_) {
-            disconnect();
-        }
+        const auto close_rc = disconnect();
+        if (close_rc != SQLITE_OK) return close_rc;
 
-        return sqlite3_open_v2(dbname, &db_, flags, vfs);
+        sqlite3* opened = nullptr;
+        const auto rc = sqlite3_open_v2(dbname, &opened, flags, vfs);
+        db_ = opened;
+        borrowing_ = false;
+        if (rc == SQLITE_OK) rebind_handlers();
+        return rc;
     }
 
     int database::disconnect()
     {
         auto rc = SQLITE_OK;
         if (db_) {
+            if (borrowing_) {
+                clear_handlers();
+                db_ = nullptr;
+                borrowing_ = false;
+                return SQLITE_OK;
+            }
             rc = sqlite3_close(db_);
             if (rc == SQLITE_OK) {
                 db_ = nullptr;
+                busy_handler_installed_ = false;
+                commit_handler_installed_ = false;
+                rollback_handler_installed_ = false;
+                update_handler_installed_ = false;
+                authorize_handler_installed_ = false;
             }
         }
 
         return rc;
+    }
+
+    void database::clear_handlers()
+    {
+        if (!db_) return;
+        if (busy_handler_installed_) sqlite3_busy_handler(db_, nullptr, nullptr);
+        if (commit_handler_installed_) sqlite3_commit_hook(db_, nullptr, nullptr);
+        if (rollback_handler_installed_) sqlite3_rollback_hook(db_, nullptr, nullptr);
+        if (update_handler_installed_) sqlite3_update_hook(db_, nullptr, nullptr);
+        if (authorize_handler_installed_) sqlite3_set_authorizer(db_, nullptr, nullptr);
+        busy_handler_installed_ = false;
+        commit_handler_installed_ = false;
+        rollback_handler_installed_ = false;
+        update_handler_installed_ = false;
+        authorize_handler_installed_ = false;
+    }
+
+    void database::rebind_handlers()
+    {
+        if (!db_) return;
+        busy_handler_installed_ = static_cast<bool>(bh_);
+        commit_handler_installed_ = static_cast<bool>(ch_);
+        rollback_handler_installed_ = static_cast<bool>(rh_);
+        update_handler_installed_ = static_cast<bool>(uh_);
+        authorize_handler_installed_ = static_cast<bool>(ah_);
+        sqlite3_busy_handler(db_, busy_handler_installed_ ? busy_handler_impl : nullptr, busy_handler_installed_ ? &bh_ : nullptr);
+        sqlite3_commit_hook(db_, commit_handler_installed_ ? commit_hook_impl : nullptr, commit_handler_installed_ ? &ch_ : nullptr);
+        sqlite3_rollback_hook(db_, rollback_handler_installed_ ? rollback_hook_impl : nullptr, rollback_handler_installed_ ? &rh_ : nullptr);
+        sqlite3_update_hook(db_, update_handler_installed_ ? update_hook_impl : nullptr, update_handler_installed_ ? &uh_ : nullptr);
+        sqlite3_set_authorizer(db_, authorize_handler_installed_ ? authorizer_impl : nullptr, authorize_handler_installed_ ? &ah_ : nullptr);
     }
 
     int database::attach(char const* dbname, char const* name)
@@ -489,49 +584,55 @@ namespace sqlite3pp
 
     int database::backup(char const* dbname, database& destdb, char const* destdbname, backup_handler h, int step_page)
     {
-        sqlite3_backup* bkup = sqlite3_backup_init(destdb.db_, destdbname, db_, dbname);
+        std::unique_ptr<sqlite3_backup, decltype(&sqlite3_backup_finish)> bkup(
+            sqlite3_backup_init(destdb.db_, destdbname, db_, dbname), sqlite3_backup_finish);
         if (!bkup) {
-            return error_code();
+            return destdb.error_code();
         }
         auto rc = SQLITE_OK;
         do {
-            rc = sqlite3_backup_step(bkup, step_page);
+            rc = sqlite3_backup_step(bkup.get(), step_page);
             if (h) {
-                h(sqlite3_backup_remaining(bkup), sqlite3_backup_pagecount(bkup), rc);
+                h(sqlite3_backup_remaining(bkup.get()), sqlite3_backup_pagecount(bkup.get()), rc);
             }
         } while (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
-        sqlite3_backup_finish(bkup);
-        return rc;
+        const auto finish_rc = sqlite3_backup_finish(bkup.release());
+        return finish_rc == SQLITE_OK ? rc : finish_rc;
     }
 
     void database::set_busy_handler(busy_handler h)
     {
-        bh_ = h;
-        sqlite3_busy_handler(db_, bh_ ? busy_handler_impl : 0, &bh_);
+        bh_ = std::move(h);
+        busy_handler_installed_ = db_ && static_cast<bool>(bh_);
+        if (db_) sqlite3_busy_handler(db_, busy_handler_installed_ ? busy_handler_impl : nullptr, busy_handler_installed_ ? &bh_ : nullptr);
     }
 
     void database::set_commit_handler(commit_handler h)
     {
-        ch_ = h;
-        sqlite3_commit_hook(db_, ch_ ? commit_hook_impl : 0, &ch_);
+        ch_ = std::move(h);
+        commit_handler_installed_ = db_ && static_cast<bool>(ch_);
+        if (db_) sqlite3_commit_hook(db_, commit_handler_installed_ ? commit_hook_impl : nullptr, commit_handler_installed_ ? &ch_ : nullptr);
     }
 
     void database::set_rollback_handler(rollback_handler h)
     {
-        rh_ = h;
-        sqlite3_rollback_hook(db_, rh_ ? rollback_hook_impl : 0, &rh_);
+        rh_ = std::move(h);
+        rollback_handler_installed_ = db_ && static_cast<bool>(rh_);
+        if (db_) sqlite3_rollback_hook(db_, rollback_handler_installed_ ? rollback_hook_impl : nullptr, rollback_handler_installed_ ? &rh_ : nullptr);
     }
 
     void database::set_update_handler(update_handler h)
     {
-        uh_ = h;
-        sqlite3_update_hook(db_, uh_ ? update_hook_impl : 0, &uh_);
+        uh_ = std::move(h);
+        update_handler_installed_ = db_ && static_cast<bool>(uh_);
+        if (db_) sqlite3_update_hook(db_, update_handler_installed_ ? update_hook_impl : nullptr, update_handler_installed_ ? &uh_ : nullptr);
     }
 
     void database::set_authorize_handler(authorize_handler h)
     {
-        ah_ = h;
-        sqlite3_set_authorizer(db_, ah_ ? authorizer_impl : 0, &ah_);
+        ah_ = std::move(h);
+        authorize_handler_installed_ = db_ && static_cast<bool>(ah_);
+        if (db_) sqlite3_set_authorizer(db_, authorize_handler_installed_ ? authorizer_impl : nullptr, authorize_handler_installed_ ? &ah_ : nullptr);
     }
 
     long long int database::last_insert_rowid() const
@@ -622,7 +723,13 @@ namespace sqlite3pp
 
     int statement::prepare_impl(char const* stmt)
     {
-        return sqlite3_prepare_v2(db_.db_, stmt, (int)std::strlen(stmt), &stmt_, &tail_);
+        const auto rc = sqlite3_prepare_v2(db_.db_, stmt, (int)std::strlen(stmt), &stmt_, &tail_);
+        if (rc != SQLITE_OK && stmt_) {
+            sqlite3_finalize(stmt_);
+            stmt_ = nullptr;
+            tail_ = nullptr;
+        }
+        return rc;
     }
 
     int statement::finish()
@@ -858,8 +965,15 @@ namespace sqlite3pp
 
     std::string query::rows::get(int idx, std::string) const
     {
-        char const* c = get(idx, (char const*)0);
-        return c ? std::string(c) : std::string();
+        return std::string(get(idx, std::string_view{}));
+    }
+
+    std::string_view query::rows::get(int idx, std::string_view) const
+    {
+        const auto* value = sqlite3_column_text(stmt_, idx);
+        if (!value) return {};
+        const auto size = sqlite3_column_bytes(stmt_, idx);
+        return { reinterpret_cast<const char*>(value), static_cast<size_t>(size) };
     }
 
     void const* query::rows::get(int idx, void const*) const
@@ -966,17 +1080,17 @@ namespace sqlite3pp
 
     int transaction::commit()
     {
-        auto db = db_;
-        db_ = nullptr;
-        int rc = db->execute("COMMIT");
+        if (!db_) return SQLITE_MISUSE;
+        int rc = db_->execute("COMMIT");
+        if (rc == SQLITE_OK) db_ = nullptr;
         return rc;
     }
 
     int transaction::rollback()
     {
-        auto db = db_;
-        db_ = nullptr;
-        int rc = db->execute("ROLLBACK");
+        if (!db_) return SQLITE_MISUSE;
+        int rc = db_->execute("ROLLBACK");
+        if (rc == SQLITE_OK) db_ = nullptr;
         return rc;
     }
 

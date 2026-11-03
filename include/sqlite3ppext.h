@@ -26,8 +26,9 @@
 #define SQLITE3PPEXT_H
 
 #include <cstddef>
-#include <map>
 #include <memory>
+#include <new>
+#include <exception>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -91,6 +92,9 @@ namespace sqlite3pp
         return get(idx, T());
       }
 
+      // The view is valid only for the duration of this SQLite callback.
+      std::string_view get_view(int idx) const;
+
       void result(int value);
       void result(double value);
       void result(long long int value);
@@ -116,6 +120,7 @@ namespace sqlite3pp
       long long int get(int idx, long long int) const;
       char const* get(int idx, char const*) const;
       std::string get(int idx, std::string) const;
+      std::string_view get(int idx, std::string_view) const;
       void const* get(int idx, void const*) const;
 
       template<class H, class... Ts>
@@ -137,12 +142,22 @@ namespace sqlite3pp
 
     namespace
     {
+      template<class T>
+      void destroy_user_data(void* data)
+      {
+        delete static_cast<T*>(data);
+      }
+
       template <class R, class... Ps>
       void functionx_impl(sqlite3_context* ctx, int nargs, sqlite3_value** values)
       {
-        context c(ctx, nargs, values);
-        auto f = static_cast<std::function<R (Ps...)>*>(sqlite3_user_data(ctx));
-        c.result(apply(*f, c.to_tuple<Ps...>()));
+        try {
+          context c(ctx, nargs, values);
+          auto f = static_cast<std::function<R (Ps...)>*>(sqlite3_user_data(ctx));
+          c.result(apply(*f, c.to_tuple<Ps...>()));
+        }
+        catch (const std::exception& ex) { sqlite3_result_error(ctx, ex.what(), -1); }
+        catch (...) { sqlite3_result_error(ctx, "User-defined function failed", -1); }
       }
     }
 
@@ -157,8 +172,9 @@ namespace sqlite3pp
       int create(char const* name, function_handler h, int nargs = 0);
 
       template <class F> int create(char const* name, std::function<F> h) {
-        fh_[name] = std::shared_ptr<void>(new std::function<F>(h));
-        return create_function_impl<F>()(db_, fh_[name].get(), name);
+        using handler_type = std::function<F>;
+        auto* handler = new handler_type(std::move(h));
+        return create_function_impl<F>()(db_, handler, name);
       }
 
      private:
@@ -170,37 +186,69 @@ namespace sqlite3pp
       struct create_function_impl<R (Ps...)>
       {
         int operator()(sqlite3* db, void* fh, char const* name) {
-          return sqlite3_create_function(db, name, sizeof...(Ps), SQLITE_UTF8, fh,
-                                         functionx_impl<R, Ps...>,
-                                         0, 0);
+          using handler_type = std::function<R (Ps...)>;
+          return sqlite3_create_function_v2(db, name, sizeof...(Ps), SQLITE_UTF8, fh,
+                                            functionx_impl<R, Ps...>, 0, 0,
+                                            destroy_user_data<handler_type>);
         }
       };
 
      private:
       sqlite3* db_;
 
-      std::map<std::string, pfunction_base> fh_;
     };
 
     namespace
     {
+      template<class T>
+      struct aggregate_state
+      {
+        aggregate_state() : initialized(false), failed(false) {}
+        bool initialized;
+        bool failed;
+        typename std::aligned_storage<sizeof(T), alignof(T)>::type storage;
+      };
+
       template <class T, class... Ps>
       void stepx_impl(sqlite3_context* ctx, int nargs, sqlite3_value** values)
       {
-        context c(ctx, nargs, values);
-        T* t = static_cast<T*>(c.aggregate_data(sizeof(T)));
-        if (c.aggregate_count() == 1) new (t) T;
-        apply([](T* tt, Ps... ps){tt->step(ps...);},
-              std::tuple_cat(std::make_tuple(t), c.to_tuple<Ps...>()));
+        auto* state = static_cast<aggregate_state<T>*>(sqlite3_aggregate_context(ctx, sizeof(aggregate_state<T>)));
+        if (!state) { sqlite3_result_error_nomem(ctx); return; }
+        if (sqlite3_aggregate_count(ctx) == 1) new (state) aggregate_state<T>();
+        if (state->failed) return;
+        try {
+          if (!state->initialized) {
+            new (&state->storage) T();
+            state->initialized = true;
+          }
+          context c(ctx, nargs, values);
+          auto* value = reinterpret_cast<T*>(&state->storage);
+          apply([&](T* aggregate, auto&&... args) {
+            aggregate->step(std::forward<decltype(args)>(args)...);
+          }, std::tuple_cat(std::make_tuple(value), c.to_tuple<Ps...>()));
+        }
+        catch (const std::exception& ex) { state->failed = true; sqlite3_result_error(ctx, ex.what(), -1); }
+        catch (...) { state->failed = true; sqlite3_result_error(ctx, "User-defined aggregate failed", -1); }
       }
 
       template <class T>
       void finishN_impl(sqlite3_context* ctx)
       {
-        context c(ctx);
-        T* t = static_cast<T*>(c.aggregate_data(sizeof(T)));
-        c.result(t->finish());
-        t->~T();
+        auto* state = static_cast<aggregate_state<T>*>(sqlite3_aggregate_context(ctx, 0));
+        if (!state || !state->initialized) return;
+        auto* value = reinterpret_cast<T*>(&state->storage);
+        if (state->failed) {
+          sqlite3_result_error(ctx, "User-defined aggregate failed", -1);
+        } else {
+          try {
+            context c(ctx);
+            c.result(value->finish());
+          }
+          catch (const std::exception& ex) { sqlite3_result_error(ctx, ex.what(), -1); }
+          catch (...) { sqlite3_result_error(ctx, "User-defined aggregate failed", -1); }
+        }
+        value->~T();
+        state->~aggregate_state<T>();
       }
     }
 
@@ -216,13 +264,13 @@ namespace sqlite3pp
 
       template <class T, class... Ps>
       int create(char const* name) {
-        return sqlite3_create_function(db_, name, sizeof...(Ps), SQLITE_UTF8, 0, 0, stepx_impl<T, Ps...>, finishN_impl<T>);
+        return sqlite3_create_function_v2(db_, name, sizeof...(Ps), SQLITE_UTF8, nullptr, nullptr,
+                                          stepx_impl<T, Ps...>, finishN_impl<T>, nullptr);
       }
 
     private:
       sqlite3* db_;
 
-      std::map<std::string, std::pair<pfunction_base, pfunction_base> > ah_;
     };
 
     namespace
@@ -230,25 +278,35 @@ namespace sqlite3pp
 
         void function_impl(sqlite3_context* ctx, int nargs, sqlite3_value** values)
         {
+          try {
             auto f = static_cast<function::function_handler*>(sqlite3_user_data(ctx));
             context c(ctx, nargs, values);
             (*f)(c);
+          }
+          catch (const std::exception& ex) { sqlite3_result_error(ctx, ex.what(), -1); }
+          catch (...) { sqlite3_result_error(ctx, "User-defined function failed", -1); }
         }
 
         void step_impl(sqlite3_context* ctx, int nargs, sqlite3_value** values)
         {
-            auto p = static_cast<std::pair<aggregate::pfunction_base, aggregate::pfunction_base>*>(sqlite3_user_data(ctx));
-            auto s = static_cast<aggregate::function_handler*>((*p).first.get());
-            context c(ctx, nargs, values);
-            ((function::function_handler&)*s)(c);
+            try {
+              auto p = static_cast<std::pair<aggregate::function_handler, aggregate::function_handler>*>(sqlite3_user_data(ctx));
+              context c(ctx, nargs, values);
+              p->first(c);
+            }
+            catch (const std::exception& ex) { sqlite3_result_error(ctx, ex.what(), -1); }
+            catch (...) { sqlite3_result_error(ctx, "User-defined aggregate failed", -1); }
         }
 
         void finalize_impl(sqlite3_context* ctx)
         {
-            auto p = static_cast<std::pair<aggregate::pfunction_base, aggregate::pfunction_base>*>(sqlite3_user_data(ctx));
-            auto f = static_cast<aggregate::function_handler*>((*p).second.get());
-            context c(ctx);
-            ((function::function_handler&)*f)(c);
+            try {
+              auto p = static_cast<std::pair<aggregate::function_handler, aggregate::function_handler>*>(sqlite3_user_data(ctx));
+              context c(ctx);
+              p->second(c);
+            }
+            catch (const std::exception& ex) { sqlite3_result_error(ctx, ex.what(), -1); }
+            catch (...) { sqlite3_result_error(ctx, "User-defined aggregate failed", -1); }
         }
 
     } // namespace
@@ -299,7 +357,20 @@ namespace sqlite3pp
 
     std::string context::get(int idx, std::string) const
     {
-        return get(idx, (char const*)0);
+      return std::string(get(idx, std::string_view{}));
+    }
+
+    std::string_view context::get(int idx, std::string_view) const
+    {
+      const auto* value = sqlite3_value_text(values_[idx]);
+      if (!value) return {};
+      const auto size = sqlite3_value_bytes(values_[idx]);
+      return { reinterpret_cast<const char*>(value), static_cast<size_t>(size) };
+    }
+
+    std::string_view context::get_view(int idx) const
+    {
+      return get(idx, std::string_view{});
     }
 
     void const* context::get(int idx, void const*) const
@@ -326,12 +397,13 @@ namespace sqlite3pp
 
     void context::result(std::string const& value)
     {
-        result(value.c_str(), false);
+      result(value.c_str(), true);
     }
 
     void context::result(char const* value, bool fcopy)
     {
-        sqlite3_result_text(ctx_, value, (int)std::strlen(value), fcopy ? SQLITE_TRANSIENT : SQLITE_STATIC);
+      if (!value) return result();
+      sqlite3_result_text(ctx_, value, (int)std::strlen(value), fcopy ? SQLITE_TRANSIENT : SQLITE_STATIC);
     }
 
     void context::result(void const* value, int n, bool fcopy)
@@ -375,8 +447,9 @@ namespace sqlite3pp
 
     int function::create(char const* name, function_handler h, int nargs)
     {
-        fh_[name] = pfunction_base(new function_handler(h));
-        return sqlite3_create_function(db_, name, nargs, SQLITE_UTF8, fh_[name].get(), function_impl, 0, 0);
+      auto* handler = new function_handler(std::move(h));
+      return sqlite3_create_function_v2(db_, name, nargs, SQLITE_UTF8, handler, function_impl, 0, 0,
+                        destroy_user_data<function_handler>);
     }
 
     aggregate::aggregate(database& db) : db_(db.db_)
@@ -385,8 +458,10 @@ namespace sqlite3pp
 
     int aggregate::create(char const* name, function_handler s, function_handler f, int nargs)
     {
-        ah_[name] = std::make_pair(pfunction_base(new function_handler(s)), pfunction_base(new function_handler(f)));
-        return sqlite3_create_function(db_, name, nargs, SQLITE_UTF8, &ah_[name], 0, step_impl, finalize_impl);
+      using handlers_type = std::pair<function_handler, function_handler>;
+      auto* handlers = new handlers_type(std::move(s), std::move(f));
+      return sqlite3_create_function_v2(db_, name, nargs, SQLITE_UTF8, handlers, 0, step_impl, finalize_impl,
+                        destroy_user_data<handlers_type>);
     }
 
   } // namespace ext
